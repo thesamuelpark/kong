@@ -1041,7 +1041,7 @@ do
           if err then
             return nil, self.errors:database_error("could not gather " ..
                                                    "associated entities " ..
-                                                   "for delete cascade: ", err)
+                                                   "for delete cascade: " .. err)
           end
 
           local row_pk = constraint.schema:extract_pk_values(row)
@@ -1049,7 +1049,7 @@ do
           _, err = strategy:delete(row_pk)
           if err then
             return nil, self.errors:database_error("could not cascade " ..
-                                                   "delete entity: ", err)
+                                                   "delete entity: " .. err)
           end
         end
       end
