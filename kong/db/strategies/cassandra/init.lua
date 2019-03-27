@@ -114,7 +114,7 @@ local function build_queries(self)
   local select_bind_args = new_tab(n_pk, 0)
   for _, field_name in self.each_pk_field() do
     if schema.fields[field_name].type == "foreign"  then
-      field_name = field_name .. "_id"
+      field_name = field_name .. "_" .. schema.fields[field_name].schema.primary_key[1]
     end
 
     insert(select_bind_args, field_name .. " = ?")
@@ -230,8 +230,6 @@ local function get_query(self, query_name)
 end
 
 
-local serialize_foreign_pk
-
 local function serialize_arg(field, arg)
   local serialized_arg
 
@@ -287,7 +285,9 @@ local function serialize_arg(field, arg)
     serialized_arg = cassandra.text(cjson.encode(arg))
 
   elseif field.type == "foreign" then
-    serialized_arg = cassandra.uuid(arg.id)
+    local fk_pk = field.schema.primary_key[1]
+    local fk_field = field.schema.fields[fk_pk]
+    serialized_arg = serialize_arg(fk_field, arg[fk_pk])
 
   else
     error("[cassandra strategy] don't know how to serialize field")
@@ -297,7 +297,7 @@ local function serialize_arg(field, arg)
 end
 
 
-serialize_foreign_pk = function(db_columns, args, args_names, foreign_pk)
+local function serialize_foreign_pk(db_columns, args, args_names, foreign_pk)
   for _, db_column in ipairs(db_columns) do
     local to_serialize
 
