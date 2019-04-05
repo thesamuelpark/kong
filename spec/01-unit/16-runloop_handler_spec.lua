@@ -100,12 +100,12 @@ describe("runloop handler", function()
         return nil, "error injected by test (feel free to ignore :) )"
       end)
 
-      local rebuild_plugins_map_spy = spy.new(function()
+      local rebuild_plugins_spy = spy.new(function()
         return nil, "error injected by test (feel free to ignore :) )"
       end)
 
       handler._set_rebuild_router(rebuild_router_spy)
-      handler._set_rebuild_plugins_map(rebuild_plugins_map_spy)
+      handler._set_rebuild_plugins(rebuild_plugins_spy)
 
       handler.init_worker.before()
 
@@ -115,7 +115,7 @@ describe("runloop handler", function()
       handler.access.before({})
 
       assert.spy(rebuild_router_spy).was_called(1)
-      assert.spy(rebuild_plugins_map_spy).was_called(1)
+      assert.spy(rebuild_plugins_spy).was_called(1)
 
       -- check semaphore
       assert.equal(1, semaphores[1].value)
@@ -128,10 +128,10 @@ describe("runloop handler", function()
       local handler = require "kong.runloop.handler"
 
       local rebuild_router_spy = spy.new(function() end)
-      local rebuild_plugins_map_spy = spy.new(function() end)
+      local rebuild_plugins_spy = spy.new(function() end)
 
       handler._set_rebuild_router(rebuild_router_spy)
-      handler._set_rebuild_plugins_map(rebuild_plugins_map_spy)
+      handler._set_rebuild_plugins(rebuild_plugins_spy)
 
       handler.init_worker.before()
 
@@ -147,7 +147,7 @@ describe("runloop handler", function()
 
       -- was called even if semaphore timed out on acquisition
       assert.spy(rebuild_router_spy).was_called(1)
-      assert.spy(rebuild_plugins_map_spy).was_called(1)
+      assert.spy(rebuild_plugins_spy).was_called(1)
 
       -- check semaphore
       assert.equal(1, semaphores[1].value)

@@ -348,7 +348,7 @@ function Kong.init_worker()
     return
   end
 
-  local ok, err = cache:get("plugins_map:version", { ttl = 0 }, function()
+  local ok, err = cache:get("plugins:version", { ttl = 0 }, function()
     return "init"
   end)
   if not ok then
@@ -386,7 +386,7 @@ function Kong.ssl_certificate()
 
   runloop.certificate.before(ctx)
 
-  configured_plugins = runloop.get_plugins_map()
+  configured_plugins = runloop.get_plugins()
   for plugin, plugin_conf in plugins_iterator(ctx, loaded_plugins,
                                               configured_plugins, true) do
     kong_global.set_namespaced_log(kong, plugin.name)
@@ -502,7 +502,7 @@ function Kong.rewrite()
   -- we're just using the iterator, as in this rewrite phase no consumer nor
   -- route will have been identified, hence we'll just be executing the global
   -- plugins
-  configured_plugins = runloop.get_plugins_map()
+  configured_plugins = runloop.get_plugins()
   for plugin, plugin_conf in plugins_iterator(ctx, loaded_plugins,
                                               configured_plugins, true) do
     kong_global.set_named_ctx(kong, "plugin", plugin_conf)
@@ -523,7 +523,7 @@ function Kong.preread()
 
   runloop.preread.before(ctx)
 
-  configured_plugins = runloop.get_plugins_map()
+  configured_plugins = runloop.get_plugins()
   for plugin, plugin_conf in plugins_iterator(ctx, loaded_plugins,
                                               configured_plugins, true) do
     kong_global.set_named_ctx(kong, "plugin", plugin_conf)
@@ -637,7 +637,7 @@ function Kong.handle_error()
   ctx.KONG_UNEXPECTED = true
 
   if not ctx.plugins_for_request then
-    configured_plugins = runloop.get_plugins_map()
+    configured_plugins = runloop.get_plugins()
     for _ in plugins_iterator(ctx, loaded_plugins, configured_plugins, true) do
       -- just build list of plugins
     end

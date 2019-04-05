@@ -96,20 +96,20 @@ for _, strategy in helpers.each_strategy() do
       proxy_client_2:close()
     end)
 
-    describe("plugins_map:version", function()
+    describe("plugins:version", function()
       local service_plugin_id
 
       it("is created at startup", function()
         local admin_res_1 = assert(admin_client_1:send {
           method = "GET",
-          path   = "/cache/plugins_map:version",
+          path   = "/cache/plugins:version",
         })
         local body_1 = assert.res_status(200, admin_res_1)
         local json_1 = cjson.decode(body_1)
 
         local admin_res_2 = assert(admin_client_2:send {
           method = "GET",
-          path   = "/cache/plugins_map:version",
+          path   = "/cache/plugins:version",
         })
         local body_2 = assert.res_status(200, admin_res_2)
         local json_2 = cjson.decode(body_2)
@@ -121,14 +121,14 @@ for _, strategy in helpers.each_strategy() do
       it("is invalidated on plugin creation", function()
         local admin_res_1 = assert(admin_client_1:send {
           method = "GET",
-          path   = "/cache/plugins_map:version",
+          path   = "/cache/plugins:version",
         })
         local body_1 = assert.res_status(200, admin_res_1)
         local json_1 = cjson.decode(body_1)
 
         local admin_res_2 = assert(admin_client_2:send {
           method = "GET",
-          path   = "/cache/plugins_map:version",
+          path   = "/cache/plugins:version",
         })
         local body_2 = assert.res_status(200, admin_res_2)
         local json_2 = cjson.decode(body_2)
@@ -157,7 +157,7 @@ for _, strategy in helpers.each_strategy() do
 
         local admin_res_1 = assert(admin_client_1:send {
           method = "GET",
-          path   = "/cache/plugins_map:version",
+          path   = "/cache/plugins:version",
         })
 
         local body_1 = assert.res_status(200, admin_res_1)
@@ -165,7 +165,7 @@ for _, strategy in helpers.each_strategy() do
 
         local admin_res_2 = assert(admin_client_2:send {
           method = "GET",
-          path   = "/cache/plugins_map:version",
+          path   = "/cache/plugins:version",
         })
         local body_2 = assert.res_status(200, admin_res_2)
         local json_2 = cjson.decode(body_2)
@@ -199,14 +199,14 @@ for _, strategy in helpers.each_strategy() do
 
         local admin_res_1 = assert(admin_client_1:send {
           method = "GET",
-          path   = "/cache/plugins_map:version",
+          path   = "/cache/plugins:version",
         })
         local body_1 = assert.res_status(200, admin_res_1)
         local json_1 = cjson.decode(body_1)
 
         local admin_res_2 = assert(admin_client_2:send {
           method = "GET",
-          path   = "/cache/plugins_map:version",
+          path   = "/cache/plugins:version",
         })
         local body_2 = assert.res_status(200, admin_res_2)
         local json_2 = cjson.decode(body_2)
@@ -236,7 +236,7 @@ for _, strategy in helpers.each_strategy() do
 
         local admin_res_1 = assert(admin_client_1:send {
           method = "GET",
-          path   = "/cache/plugins_map:version",
+          path   = "/cache/plugins:version",
         })
 
         local body_1 = assert.res_status(200, admin_res_1)
@@ -244,7 +244,7 @@ for _, strategy in helpers.each_strategy() do
 
         local admin_res_2 = assert(admin_client_2:send {
           method = "GET",
-          path   = "/cache/plugins_map:version",
+          path   = "/cache/plugins:version",
         })
 
         local body_2 = assert.res_status(200, admin_res_2)
@@ -269,7 +269,7 @@ for _, strategy in helpers.each_strategy() do
 
         local admin_res_1 = assert(admin_client_1:send {
           method = "GET",
-          path   = "/cache/plugins_map:version",
+          path   = "/cache/plugins:version",
         })
 
         local body_1 = assert.res_status(200, admin_res_1)
@@ -277,7 +277,7 @@ for _, strategy in helpers.each_strategy() do
 
         local admin_res_2 = assert(admin_client_2:send {
           method = "GET",
-          path   = "/cache/plugins_map:version",
+          path   = "/cache/plugins:version",
         })
 
         local body_2 = assert.res_status(200, admin_res_2)
@@ -310,7 +310,7 @@ for _, strategy in helpers.each_strategy() do
 
         local admin_res_1 = assert(admin_client_1:send {
           method = "GET",
-          path   = "/cache/plugins_map:version",
+          path   = "/cache/plugins:version",
         })
 
         local body_1 = assert.res_status(200, admin_res_1)
@@ -318,7 +318,7 @@ for _, strategy in helpers.each_strategy() do
 
         local admin_res_2 = assert(admin_client_2:send {
           method = "GET",
-          path   = "/cache/plugins_map:version",
+          path   = "/cache/plugins:version",
         })
 
         local body_2 = assert.res_status(200, admin_res_2)

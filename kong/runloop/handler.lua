@@ -63,16 +63,16 @@ local init_router
 local get_router
 local build_router
 local rebuild_router
-local build_router_semaphore
+local router_semaphore
 local _set_rebuild_router
 
 
-local init_plugins_map
-local get_plugins_map
-local build_plugins_map
-local rebuild_plugins_map
-local build_plugins_map_semaphore
-local _set_rebuild_plugins_map
+local init_plugins
+local get_plugins
+local build_plugins
+local rebuild_plugins
+local plugins_semaphore
+local _set_rebuild_plugins
 
 
 local declarative_entities
@@ -110,8 +110,8 @@ local function load_declarative_config()
   end
 
   if not kong.configuration.declarative_config then
-    -- no configuration yet, just build empty plugins map
-    rebuild_plugins_map(60)
+    -- no configuration yet, just build empty plugins
+    rebuild_plugins(60)
     return true
   end
 
@@ -133,7 +133,7 @@ local function load_declarative_config()
     kong.log.notice("declarative config loaded from ",
                     kong.configuration.declarative_config)
 
-    build_plugins_map(utils.uuid())
+    build_plugins(utils.uuid())
 
     assert(build_router("init"))
 
@@ -170,11 +170,11 @@ do
   local router
   local router_version
 
-  local plugins_map
-  local plugins_map_version
+  local plugins
+  local plugins_version
 
   local function lock_router(wait)
-    local ok, err = build_router_semaphore:wait(wait or 0)
+    local ok, err = router_semaphore:wait(wait or 0)
     if not ok then
       if err ~= "timeout" then
         log(ERR, "error attempting to acquire router lock: " .. err)
@@ -188,13 +188,13 @@ do
     return true
   end
 
-  local function lock_plugins_map(wait)
-    local ok, err = build_plugins_map_semaphore:wait(wait or 0)
+  local function lock_plugins(wait)
+    local ok, err = plugins_semaphore:wait(wait or 0)
     if not ok then
       if err ~= "timeout" then
-        log(ERR, "error attempting to acquire plugins map lock: " .. err)
+        log(ERR, "error attempting to acquire plugins lock: " .. err)
       elseif wait and wait > 0 then
-        log(NOTICE, "timeout attempting to acquire plugins map lock")
+        log(NOTICE, "timeout attempting to acquire plugins lock")
       end
 
       return false
@@ -204,11 +204,11 @@ do
   end
 
   local function unlock_router()
-    build_router_semaphore:post()
+    router_semaphore:post()
   end
 
-  local function unlock_plugins_map()
-    build_plugins_map_semaphore:post()
+  local function unlock_plugins()
+    plugins_semaphore:post()
   end
 
   local function get_router_version()
@@ -225,14 +225,14 @@ do
     return version
   end
 
-  local function get_plugins_map_version()
+  local function get_plugins_version()
     if not kong.cache then
       return "init"
     end
 
-    local version, err = kong.cache:get("plugins_map:version", CACHE_OPTS, utils.uuid)
+    local version, err = kong.cache:get("plugins:version", CACHE_OPTS, utils.uuid)
     if err then
-      log(CRIT, "could not ensure plugins map is up to date: ", err)
+      log(CRIT, "could not ensure plugins is up to date: ", err)
       return nil
     end
 
@@ -245,7 +245,7 @@ do
       log(ERR, "could not cache services: ", err)
     end
 
-    build_router_semaphore, err = semaphore.new(1)
+    router_semaphore, err = semaphore.new(1)
     if err then
       log(CRIT, "failed to create build router semaphore: ", err)
     end
@@ -263,22 +263,22 @@ do
     end
   end
 
-  init_plugins_map = function()
+  init_plugins = function()
     local err
-    build_plugins_map_semaphore, err = semaphore.new(1)
+    plugins_semaphore, err = semaphore.new(1)
     if err then
-      log(CRIT, "failed to create build plugins map semaphore: ", err)
+      log(CRIT, "failed to create build plugins semaphore: ", err)
     end
 
     if rebuild_timeout < 0 then
-      get_plugins_map = function()
-        return plugins_map
+      get_plugins = function()
+        return plugins
       end
 
     else
-      get_plugins_map = function()
-        rebuild_plugins_map(rebuild_timeout)
-        return plugins_map
+      get_plugins = function()
+        rebuild_plugins(rebuild_timeout)
+        return plugins
       end
     end
   end
@@ -444,9 +444,12 @@ do
 
     singletons.router = new_router
 
+    log(DEBUG, "rebuilding router done")
+
     if recurse then
       current_version = get_router_version()
       if version ~= current_version then
+        log(DEBUG, "rebuilding router")
         return build_router(current_version, recurse, tries)
       end
     end
@@ -454,22 +457,26 @@ do
     return true
   end
 
-  build_plugins_map = function(version, recurse, tries)
+  build_plugins = function(version, recurse, tries)
     tries = tries or 1
 
     local current_version
-    current_version = get_plugins_map_version()
+    current_version = get_plugins_version()
     if version ~= current_version then
-      return build_plugins_map(current_version)
+      return build_plugins(current_version)
     end
 
-    local new_plugins_map, counter = {}, 0
+    local new_plugins = {
+      map = {},
+      cache = {},
+    }
+    local counter = 0
 
     for plugin, err in kong.db.plugins:each(1000) do
       if err then
-        current_version = get_plugins_map_version()
+        current_version = get_plugins_version()
         if version ~= current_version then
-          return build_plugins_map(current_version)
+          return build_plugins(current_version)
         end
 
         if recurse and tries < 6 then
@@ -477,30 +484,43 @@ do
           log(NOTICE,  "could not load plugins: " .. err)
           sleep(0.01 * tries * tries)
           kong.db:connect()
-          return build_plugins_map(current_version, recurse, tries + 1)
+          return build_plugins(current_version, recurse, tries + 1)
         end
 
         return nil, "could not load plugins: " .. err
       end
 
       if recurse and counter % 1000 then
-        current_version = get_plugins_map_version()
+        current_version = get_plugins_version()
         if version ~= current_version then
-          return build_plugins_map(current_version)
+          return build_plugins(current_version)
         end
       end
 
-      new_plugins_map[plugin.name] = true
+      new_plugins.map[plugin.name] = true
+
+      local key = kong.db.plugins:cache_key(plugin.name,
+                                            plugin.route and
+                                            plugin.route.id,
+                                            plugin.service and
+                                            plugin.service.id,
+                                            plugin.consumer and
+                                            plugin.consumer.id)
+      new_plugins.cache[key] = plugin
+
       counter = counter + 1
     end
 
-    plugins_map_version = version
-    plugins_map = new_plugins_map
+    plugins_version = version
+    plugins = new_plugins
+
+    log(DEBUG, "rebuilding plugins done")
 
     if recurse then
-      current_version = get_plugins_map_version()
+      current_version = get_plugins_version()
       if version ~= current_version then
-        return build_plugins_map(current_version)
+        log(DEBUG, "rebuilding plugins")
+        return build_plugins(current_version)
       end
     end
 
@@ -525,20 +545,20 @@ do
     kong.db:setkeepalive()
   end
 
-  local function rebuild_plugins_map_timer(premature, version)
+  local function rebuild_plugins_timer(premature, version)
     if premature then
-      unlock_plugins_map()
+      unlock_plugins()
       return
     end
 
     kong.db:connect()
 
-    local pok, ok, err = pcall(build_plugins_map, version, true)
+    local pok, ok, err = pcall(build_plugins, version, true)
     if not pok or not ok then
-      log(CRIT, "could not asynchronously rebuild plugins map: ", ok or err)
+      log(CRIT, "could not asynchronously rebuild plugins: ", ok or err)
     end
 
-    unlock_plugins_map()
+    unlock_plugins()
 
     kong.db:setkeepalive()
   end
@@ -554,12 +574,12 @@ do
     kong.db:setkeepalive()
   end
 
-  local function rebuild_plugins_map_sync(version)
+  local function rebuild_plugins_sync(version)
     kong.db:connect()
 
-    local pok, ok, err = pcall(build_plugins_map, version)
+    local pok, ok, err = pcall(build_plugins, version)
     if not pok or not ok then
-      log(CRIT, "could not synchronously rebuild plugins map: ", ok or err)
+      log(CRIT, "could not synchronously rebuild plugins: ", ok or err)
     end
 
     kong.db:setkeepalive()
@@ -575,10 +595,10 @@ do
     return true
   end
 
-  local function rebuild_plugins_map_async(version)
-    local ok, err = ngx.timer.at(0, rebuild_plugins_map_timer, version)
+  local function rebuild_plugins_async(version)
+    local ok, err = ngx.timer.at(0, rebuild_plugins_timer, version)
     if not ok then
-      log(CRIT, "could not create rebuild plugins map timer: ", err)
+      log(CRIT, "could not create rebuild plugins timer: ", err)
       return false
     end
 
@@ -621,38 +641,38 @@ do
     end
   end
 
-  rebuild_plugins_map = function(wait)
-    local version = get_plugins_map_version()
-    if version == plugins_map_version then
+  rebuild_plugins = function(wait)
+    local version = get_plugins_version()
+    if version == plugins_version then
       return
     end
 
-    local ok = lock_plugins_map(wait)
+    local ok = lock_plugins(wait)
     if not ok then
       if wait and wait > 0 then
-        rebuild_plugins_map_sync(version)
+        rebuild_plugins_sync(version)
       end
 
       return
     end
 
-    version = get_plugins_map_version()
-    if version == plugins_map_version then
-      unlock_plugins_map()
+    version = get_plugins_version()
+    if version == plugins_version then
+      unlock_plugins()
       return
     end
 
-    log(DEBUG, "rebuilding plugins map")
+    log(DEBUG, "rebuilding plugins")
 
     if wait and wait > 0 then
-      rebuild_plugins_map_sync(version)
-      unlock_plugins_map()
+      rebuild_plugins_sync(version)
+      unlock_plugins()
 
     else
-      ok = rebuild_plugins_map_async(version)
+      ok = rebuild_plugins_async(version)
       if not ok and wait == 0 then
-        rebuild_plugins_map_sync(version)
-        unlock_plugins_map()
+        rebuild_plugins_sync(version)
+        unlock_plugins()
       end
     end
   end
@@ -662,8 +682,8 @@ do
     rebuild_router = f
   end
 
-  _set_rebuild_plugins_map = function(f)
-    rebuild_plugins_map = f
+  _set_rebuild_plugins = function(f)
+    rebuild_plugins = f
   end
 end
 
@@ -729,13 +749,13 @@ end
 -- in the table below the `before` and `after` is to indicate when they run:
 -- before or after the plugins
 return {
-  get_plugins_map = function()
-    return get_plugins_map()
+  get_plugins = function()
+    return get_plugins()
   end,
 
   -- exported for unit-testing purposes only
   _set_rebuild_router = _set_rebuild_router,
-  _set_rebuild_plugins_map = _set_rebuild_plugins_map,
+  _set_rebuild_plugins = _set_rebuild_plugins,
 
   init = {
     after = function()
@@ -748,7 +768,7 @@ return {
 
       else
         build_router("init")
-        build_plugins_map("init")
+        build_plugins("init")
       end
     end
   },
@@ -767,11 +787,13 @@ return {
         elseif kong.configuration.database == "postgres" then
           -- pg_timeout is defined in ms
           rebuild_timeout = kong.configuration.pg_timeout / 1000
+        else
+          rebuild_timeout = 60
         end
       end
 
       init_router()
-      init_plugins_map()
+      init_plugins()
 
       local ok, err = load_declarative_config()
       if not ok then
@@ -872,8 +894,8 @@ return {
 
 
       worker_events.register(function(data)
-        log(DEBUG, "[events] Plugin updated, invalidating plugins map")
-        cache:invalidate("plugins_map:version")
+        log(DEBUG, "[events] Plugin updated, invalidating plugins")
+        cache:invalidate("plugins:version")
       end, "crud", "plugins")
 
 
@@ -1031,7 +1053,7 @@ return {
         end
 
         rebuild_router()
-        rebuild_plugins_map()
+        rebuild_plugins()
       end)
     end
   },
