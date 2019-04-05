@@ -56,6 +56,9 @@ local SUBSYSTEMS = constants.PROTOCOLS_WITH_SUBSYSTEM
 local EMPTY_T = {}
 
 
+local rebuild_timeout
+
+
 local init_router
 local get_router
 local build_router
@@ -108,7 +111,7 @@ local function load_declarative_config()
 
   if not kong.configuration.declarative_config then
     -- no configuration yet, just build empty plugins map
-    rebuild_plugins_map(1)
+    rebuild_plugins_map(60)
     return true
   end
 
@@ -247,21 +250,14 @@ do
       log(CRIT, "failed to create build router semaphore: ", err)
     end
 
-    local timeout = kong.configuration.router_timeout
-    if timeout then
-      timeout = timeout / 1000
-    else
-      timeout = 5
-    end
-
-    if timeout < 0 then
+    if rebuild_timeout < 0 then
       get_router = function()
         return router
       end
 
     else
       get_router = function()
-        rebuild_router(timeout)
+        rebuild_router(rebuild_timeout)
         return router
       end
     end
@@ -274,21 +270,14 @@ do
       log(CRIT, "failed to create build plugins map semaphore: ", err)
     end
 
-    local timeout = kong.configuration.plugins_map_timeout
-    if timeout then
-      timeout = timeout / 1000
-    else
-      timeout = 5
-    end
-
-    if timeout < 0 then
+    if rebuild_timeout < 0 then
       get_plugins_map = function()
         return plugins_map
       end
 
     else
       get_plugins_map = function()
-        rebuild_plugins_map(timeout)
+        rebuild_plugins_map(rebuild_timeout)
         return plugins_map
       end
     end
@@ -766,6 +755,21 @@ return {
 
   init_worker = {
     before = function()
+      if kong.configuration.database == "off" then
+        rebuild_timeout = 60
+
+      else
+        if kong.configuration.async_rebuilds then
+          rebuild_timeout = -1
+        elseif kong.configuration.database == "cassandra" then
+          -- cassandra_timeout is defined in ms
+          rebuild_timeout = kong.configuration.cassandra_timeout / 1000
+        elseif kong.configuration.database == "postgres" then
+          -- pg_timeout is defined in ms
+          rebuild_timeout = kong.configuration.pg_timeout / 1000
+        end
+      end
+
       init_router()
       init_plugins_map()
 
