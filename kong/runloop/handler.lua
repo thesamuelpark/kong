@@ -155,7 +155,7 @@ do
         return nil, err
       end
 
-      local cache_key = kong.db.services:cache_key(service.id)
+      local cache_key = kong.db.services:cache_key(service)
       service, err = kong.cache:get(cache_key, CACHE_OPTS, function()
         return service
       end)
@@ -301,7 +301,7 @@ do
   local function load_service(service_pk)
     local service, err
     if kong.cache then
-      local cache_key = kong.db.services:cache_key(service_pk.id)
+      local cache_key = kong.db.services:cache_key(service_pk)
       service, err = kong.cache:get(cache_key, CACHE_OPTS,
         load_service_db, service_pk)
 
@@ -499,13 +499,7 @@ do
 
       new_plugins.map[plugin.name] = true
 
-      local key = kong.db.plugins:cache_key(plugin.name,
-                                            plugin.route and
-                                            plugin.route.id,
-                                            plugin.service and
-                                            plugin.service.id,
-                                            plugin.consumer and
-                                            plugin.consumer.id)
+      local key = kong.db.plugins:cache_key(plugin)
       new_plugins.cache[key] = plugin
 
       counter = counter + 1
