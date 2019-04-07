@@ -294,6 +294,16 @@ do
     return false
   end
 
+  local function should_process_plugin(plugin)
+    for _, protocol in ipairs(plugin.protocols) do
+      if SUBSYSTEMS[protocol] == subsystem then
+        return true
+      end
+    end
+
+    return false
+  end
+
   local function load_service_db(service_pk)
     local service, err = kong.db.services:select(service_pk)
     return service, err
@@ -514,10 +524,12 @@ do
         end
       end
 
-      new_plugins.map[plugin.name] = true
+      if should_process_plugin(plugin) then
+        new_plugins.map[plugin.name] = true
 
-      local key = kong.db.plugins:cache_key(plugin)
-      new_plugins.cache[key] = plugin
+        local key = kong.db.plugins:cache_key(plugin)
+        new_plugins.cache[key] = plugin
+      end
 
       counter = counter + 1
     end
