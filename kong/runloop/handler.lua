@@ -56,6 +56,7 @@ local SUBSYSTEMS = constants.PROTOCOLS_WITH_SUBSYSTEM
 local EMPTY_T = {}
 
 
+local worker_id
 local rebuild_timeout
 
 
@@ -340,6 +341,12 @@ do
   end
 
   build_router = function(version, recurse, tries)
+    if version == "init" then
+      log(DEBUG, "initialising router...")
+    else
+      log(DEBUG, "rebuilding router on worker #", ngx.worker.id(), "...")
+    end
+
     tries = tries or 1
 
     local current_version
@@ -444,12 +451,16 @@ do
 
     singletons.router = new_router
 
-    log(DEBUG, "rebuilding router done")
+    if version == "init" then
+      log(DEBUG, "initializing router done")
+    else
+      log(DEBUG, "rebuilding router on worker #", ngx.worker.id(), " done")
+    end
 
     if recurse then
       current_version = get_router_version()
       if version ~= current_version then
-        log(DEBUG, "rebuilding router")
+        log(DEBUG, "rebuilding router on worker #", ngx.worker.id())
         return build_router(current_version, recurse, tries)
       end
     end
@@ -458,6 +469,12 @@ do
   end
 
   build_plugins = function(version, recurse, tries)
+    if version == "init" then
+      log(DEBUG, "initialising plugins...")
+    else
+      log(DEBUG, "rebuilding plugins on worker #", ngx.worker.id(), "...")
+    end
+
     tries = tries or 1
 
     local current_version
@@ -508,12 +525,16 @@ do
     plugins_version = version
     plugins = new_plugins
 
-    log(DEBUG, "rebuilding plugins done")
+    if version == "init" then
+      log(DEBUG, "initializing plugins done")
+    else
+      log(DEBUG, "rebuilding plugins on worker #", worker_id, " done")
+    end
 
     if recurse then
       current_version = get_plugins_version()
       if version ~= current_version then
-        log(DEBUG, "rebuilding plugins")
+        log(DEBUG, "rebuilding plugins on worker #", worker_id)
         return build_plugins(current_version)
       end
     end
@@ -619,8 +640,6 @@ do
       unlock_router()
       return
     end
-
-    log(DEBUG, "rebuilding router")
 
     if wait and wait > 0 then
       rebuild_router_sync(version)
@@ -769,6 +788,8 @@ return {
 
   init_worker = {
     before = function()
+      worker_id = ngx.worker.id()
+
       if kong.configuration.database == "off" then
         rebuild_timeout = 60
 
