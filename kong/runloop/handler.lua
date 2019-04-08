@@ -151,6 +151,8 @@ local function cache_services()
       return nil, err
     end
 
+    kong.dns.toip(service.host)
+
     local cache_key = kong.db.services:cache_key(service)
     service, err = kong.cache:get(cache_key, CACHE_OPTS, function()
       return service
