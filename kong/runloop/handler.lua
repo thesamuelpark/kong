@@ -106,13 +106,13 @@ end
 
 
 local function load_declarative_config()
-  if not kong.configuration.database == "off" then
+  if kong.configuration.database ~= "off" then
     return true
   end
 
   if not kong.configuration.declarative_config then
     -- no configuration yet, just build empty plugins
-    rebuild_plugins(60)
+    assert(build_plugins("init"))
     return true
   end
 
@@ -351,7 +351,12 @@ do
 
   build_router = function(version, recurse, tries)
     if version == "init" then
-      log(DEBUG, "initialising router...")
+      if ngx.get_phase() == "init" then
+        log(DEBUG, "initialising router...")
+      else
+        log(DEBUG, "initialising router on worker #", ngx.worker.id(), "...")
+      end
+
     else
       log(DEBUG, "rebuilding router on worker #", ngx.worker.id(), "...")
     end
@@ -461,7 +466,12 @@ do
     singletons.router = new_router
 
     if version == "init" then
-      log(DEBUG, "initializing router done")
+      if ngx.get_phase() == "init" then
+        log(DEBUG, "initialising router done")
+      else
+        log(DEBUG, "initialising router on worker #", ngx.worker.id(), " done")
+      end
+
     else
       log(DEBUG, "rebuilding router on worker #", ngx.worker.id(), " done")
     end
@@ -479,7 +489,12 @@ do
 
   build_plugins = function(version, recurse, tries)
     if version == "init" then
-      log(DEBUG, "initialising plugins...")
+      if ngx.get_phase() == "init" then
+        log(DEBUG, "initialising plugins...")
+      else
+        log(DEBUG, "initialising plugins on worker #", ngx.worker.id(), "...")
+      end
+
     else
       log(DEBUG, "rebuilding plugins on worker #", ngx.worker.id(), "...")
     end
@@ -537,7 +552,12 @@ do
     plugins = new_plugins
 
     if version == "init" then
-      log(DEBUG, "initializing plugins done")
+      if ngx.get_phase() == "init" then
+        log(DEBUG, "initialising plugins done")
+      else
+        log(DEBUG, "initialising plugins on worker #", ngx.worker.id(), " done")
+      end
+
     else
       log(DEBUG, "rebuilding plugins on worker #", worker_id, " done")
     end
