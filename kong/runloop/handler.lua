@@ -54,13 +54,10 @@ local SERVER_HEADER = meta._SERVER_TOKENS
 local CACHE_OPTS = { ttl = 0 }
 local SUBSYSTEMS = constants.PROTOCOLS_WITH_SUBSYSTEM
 local EMPTY_T = {}
+local WORKER_ID
 
 
-local worker_id
-local rebuild_timeout
-
-
-local init_router
+local router
 local get_router
 local build_router
 local rebuild_router
@@ -68,7 +65,7 @@ local router_semaphore
 local _set_rebuild_router
 
 
-local init_plugins
+local plugins
 local get_plugins
 local build_plugins
 local rebuild_plugins
@@ -144,42 +141,357 @@ local function load_declarative_config()
 end
 
 
-do
-  local function cache_services()
-    if not kong.db or not kong.cache then
-      return true
-    end
-
-    for service, err in kong.db.services:each(1000) do
-      if err then
-        return nil, err
-      end
-
-      local cache_key = kong.db.services:cache_key(service)
-      service, err = kong.cache:get(cache_key, CACHE_OPTS, function()
-        return service
-      end)
-      if err then
-        return nil, err
-      end
-    end
-
+local function cache_services()
+  if not kong.db or not kong.cache then
     return true
   end
 
-  local router
-  local router_version
+  for service, err in kong.db.services:each(1000) do
+    if err then
+      return nil, err
+    end
 
-  local plugins
+    local cache_key = kong.db.services:cache_key(service)
+    service, err = kong.cache:get(cache_key, CACHE_OPTS, function()
+      return service
+    end)
+    if err then
+      return nil, err
+    end
+  end
+
+  return true
+end
+
+
+local function start_timers()
+  -- initialize balancers for active healthchecks
+  ngx.timer.at(0, function()
+    balancer.init()
+  end)
+
+
+  ngx.timer.every(1, function(premature)
+    if premature then
+      return
+    end
+
+    rebuild_router()
+    rebuild_plugins()
+  end)
+end
+
+
+local function register_events()
+  -- initialize local local_events hooks
+  local db             = kong.db
+  local cache          = kong.cache
+  local worker_events  = kong.worker_events
+  local cluster_events = kong.cluster_events
+
+
+  -- events dispatcher
+
+
+  worker_events.register(function(data)
+    if not data.schema then
+      log(ngx.ERR, "[events] missing schema in crud subscriber")
+      return
+    end
+
+    if not data.entity then
+      log(ngx.ERR, "[events] missing entity in crud subscriber")
+      return
+    end
+
+    -- invalidate this entity anywhere it is cached if it has a
+    -- caching key
+
+    local cache_key = db[data.schema.name]:cache_key(data.entity)
+
+    if cache_key then
+      cache:invalidate(cache_key)
+    end
+
+    -- if we had an update, but the cache key was part of what was updated,
+    -- we need to invalidate the previous entity as well
+
+    if data.old_entity then
+      cache_key = db[data.schema.name]:cache_key(data.old_entity)
+      if cache_key then
+        cache:invalidate(cache_key)
+      end
+    end
+
+    if not data.operation then
+      log(ngx.ERR, "[events] missing operation in crud subscriber")
+      return
+    end
+
+    -- public worker events propagation
+
+    local entity_channel           = data.schema.table or data.schema.name
+    local entity_operation_channel = fmt("%s:%s", entity_channel,
+      data.operation)
+
+    -- crud:routes
+    local _, err = worker_events.post_local("crud", entity_channel, data)
+    if err then
+      log(ngx.ERR, "[events] could not broadcast crud event: ", err)
+      return
+    end
+
+    -- crud:routes:create
+    _, err = worker_events.post_local("crud", entity_operation_channel, data)
+    if err then
+      log(ngx.ERR, "[events] could not broadcast crud event: ", err)
+      return
+    end
+  end, "dao:crud")
+
+
+  -- local events (same worker)
+
+
+  worker_events.register(function()
+    log(DEBUG, "[events] Route updated, invalidating router")
+    cache:invalidate("router:version")
+  end, "crud", "routes")
+
+
+  worker_events.register(function(data)
+    if data.operation ~= "create" and
+      data.operation ~= "delete"
+    then
+      -- no need to rebuild the router if we just added a Service
+      -- since no Route is pointing to that Service yet.
+      -- ditto for deletion: if a Service if being deleted, it is
+      -- only allowed because no Route is pointing to it anymore.
+      log(DEBUG, "[events] Service updated, invalidating router")
+      cache:invalidate("router:version")
+    end
+  end, "crud", "services")
+
+
+  worker_events.register(function(data)
+    log(DEBUG, "[events] Plugin updated, invalidating plugins")
+    cache:invalidate("plugins:version")
+  end, "crud", "plugins")
+
+
+  -- SSL certs / SNIs invalidations
+
+
+  worker_events.register(function(data)
+    log(DEBUG, "[events] SNI updated, invalidating cached certificates")
+    local sn = data.entity
+
+    cache:invalidate("certificates:" .. sn.name)
+  end, "crud", "snis")
+
+
+  worker_events.register(function(data)
+    log(DEBUG, "[events] SSL cert updated, invalidating cached certificates")
+    local certificate = data.entity
+
+    for sn, err in db.snis:each_for_certificate({ id = certificate.id }, 1000) do
+      if err then
+        log(ERR, "[events] could not find associated snis for certificate: ",
+          err)
+        break
+      end
+
+      cache:invalidate("certificates:" .. sn.name)
+    end
+  end, "crud", "certificates")
+
+
+  -- target updates
+
+
+  -- worker_events local handler: event received from DAO
+  worker_events.register(function(data)
+    local operation = data.operation
+    local target = data.entity
+    -- => to worker_events node handler
+    local _, err = worker_events.post("balancer", "targets", {
+      operation = data.operation,
+      entity = data.entity,
+    })
+    if err then
+      log(ERR, "failed broadcasting target ",
+        operation, " to workers: ", err)
+    end
+    -- => to cluster_events handler
+    local key = fmt("%s:%s", operation, target.upstream.id)
+    _, err = cluster_events:broadcast("balancer:targets", key)
+    if err then
+      log(ERR, "failed broadcasting target ", operation, " to cluster: ", err)
+    end
+  end, "crud", "targets")
+
+
+  -- worker_events node handler
+  worker_events.register(function(data)
+    local operation = data.operation
+    local target = data.entity
+
+    -- => to balancer update
+    balancer.on_target_event(operation, target)
+  end, "balancer", "targets")
+
+
+  -- cluster_events handler
+  cluster_events:subscribe("balancer:targets", function(data)
+    local operation, key = unpack(utils.split(data, ":"))
+    -- => to worker_events node handler
+    local _, err = worker_events.post("balancer", "targets", {
+      operation = operation,
+      entity = {
+        upstream = { id = key },
+      }
+    })
+    if err then
+      log(ERR, "failed broadcasting target ", operation, " to workers: ", err)
+    end
+  end)
+
+
+  -- manual health updates
+  cluster_events:subscribe("balancer:post_health", function(data)
+    local pattern = "([^|]+)|([^|]+)|([^|]+)|([^|]+)|(.*)"
+    local ip, port, health, id, name = data:match(pattern)
+    port = tonumber(port)
+    local upstream = { id = id, name = name }
+    local _, err = balancer.post_health(upstream, ip, port, health == "1")
+    if err then
+      log(ERR, "failed posting health of ", name, " to workers: ", err)
+    end
+  end)
+
+
+  -- upstream updates
+
+
+  -- worker_events local handler: event received from DAO
+  worker_events.register(function(data)
+    local operation = data.operation
+    local upstream = data.entity
+    -- => to worker_events node handler
+    local _, err = worker_events.post("balancer", "upstreams", {
+      operation = data.operation,
+      entity = data.entity,
+    })
+    if err then
+      log(ERR, "failed broadcasting upstream ",
+        operation, " to workers: ", err)
+    end
+    -- => to cluster_events handler
+    local key = fmt("%s:%s:%s", operation, upstream.id, upstream.name)
+    local ok, err = cluster_events:broadcast("balancer:upstreams", key)
+    if not ok then
+      log(ERR, "failed broadcasting upstream ", operation, " to cluster: ", err)
+    end
+  end, "crud", "upstreams")
+
+
+  -- worker_events node handler
+  worker_events.register(function(data)
+    local operation = data.operation
+    local upstream = data.entity
+
+    -- => to balancer update
+    balancer.on_upstream_event(operation, upstream)
+  end, "balancer", "upstreams")
+
+
+  cluster_events:subscribe("balancer:upstreams", function(data)
+    local operation, id, name = unpack(utils.split(data, ":"))
+    -- => to worker_events node handler
+    local _, err = worker_events.post("balancer", "upstreams", {
+      operation = operation,
+      entity = {
+        id = id,
+        name = name,
+      }
+    })
+    if err then
+      log(ERR, "failed broadcasting upstream ", operation, " to workers: ", err)
+    end
+  end)
+end
+
+
+local function init_worker()
+  WORKER_ID = ngx.worker.id()
+
+  local rebuild_timeout = 60
+  if kong.configuration.database ~= "off" then
+    if kong.configuration.async_rebuilds then
+      rebuild_timeout = -1
+    elseif kong.configuration.database == "cassandra" then
+      rebuild_timeout = kong.configuration.cassandra_timeout / 1000
+    elseif kong.configuration.database == "postgres" then
+      rebuild_timeout = kong.configuration.pg_timeout / 1000
+    end
+  end
+
+  local _, err = cache_services()
+  if err then
+    log(ERR, "could not cache services: ", err)
+  end
+
+  router_semaphore, err = semaphore.new(1)
+  if err then
+    log(CRIT, "failed to create build router semaphore: ", err)
+  end
+
+  plugins_semaphore, err = semaphore.new(1)
+  if err then
+    log(CRIT, "failed to create build plugins semaphore: ", err)
+  end
+
+  if rebuild_timeout < 0 then
+    get_router = function()
+      return router
+    end
+
+    get_plugins = function()
+      return plugins
+    end
+
+  else
+    get_router = function()
+      rebuild_router(rebuild_timeout)
+      return router
+    end
+
+    get_plugins = function()
+      rebuild_plugins(rebuild_timeout)
+      return plugins
+    end
+  end
+
+  local ok, err = load_declarative_config()
+  if not ok then
+    log(CRIT, "error loading declarative config file: ", err)
+  end
+
+  reports.init_worker()
+end
+
+
+do
+  local router_version
   local plugins_version
 
-  local function lock_router(wait)
-    local ok, err = router_semaphore:wait(wait or 0)
+  local function acquire_semaphore(semaphore, wait)
+    local ok, err = semaphore:wait(wait or 0)
     if not ok then
       if err ~= "timeout" then
-        log(ERR, "error attempting to acquire router lock: " .. err)
+        log(ERR, "error attempting to acquire semaphore: " .. err)
       elseif wait and wait > 0 then
-        log(NOTICE, "timeout attempting to acquire router lock")
+        log(NOTICE, "timeout attempting to acquire semaphore")
       end
 
       return false
@@ -188,99 +500,22 @@ do
     return true
   end
 
-  local function lock_plugins(wait)
-    local ok, err = plugins_semaphore:wait(wait or 0)
-    if not ok then
-      if err ~= "timeout" then
-        log(ERR, "error attempting to acquire plugins lock: " .. err)
-      elseif wait and wait > 0 then
-        log(NOTICE, "timeout attempting to acquire plugins lock")
-      end
-
-      return false
-    end
-
-    return true
+  local function release_semaphore(semaphore)
+    semaphore:post()
   end
 
-  local function unlock_router()
-    router_semaphore:post()
-  end
-
-  local function unlock_plugins()
-    plugins_semaphore:post()
-  end
-
-  local function get_router_version()
+  local function get_version(name)
     if not kong.cache then
       return "init"
     end
 
-    local version, err = kong.cache:get("router:version", CACHE_OPTS, utils.uuid)
+    local version, err = kong.cache:get(name .. ":version", CACHE_OPTS, utils.uuid)
     if err then
-      log(CRIT, "could not ensure router is up to date: ", err)
+      log(CRIT, "could not ensure ", name," is up to date: ", err)
       return nil
     end
 
     return version
-  end
-
-  local function get_plugins_version()
-    if not kong.cache then
-      return "init"
-    end
-
-    local version, err = kong.cache:get("plugins:version", CACHE_OPTS, utils.uuid)
-    if err then
-      log(CRIT, "could not ensure plugins is up to date: ", err)
-      return nil
-    end
-
-    return version
-  end
-
-  init_router = function()
-    local _, err = cache_services()
-    if err then
-      log(ERR, "could not cache services: ", err)
-    end
-
-    router_semaphore, err = semaphore.new(1)
-    if err then
-      log(CRIT, "failed to create build router semaphore: ", err)
-    end
-
-    if rebuild_timeout < 0 then
-      get_router = function()
-        return router
-      end
-
-    else
-      get_router = function()
-        rebuild_router(rebuild_timeout)
-        return router
-      end
-    end
-  end
-
-  init_plugins = function()
-    local err
-    plugins_semaphore, err = semaphore.new(1)
-    if err then
-      log(CRIT, "failed to create build plugins semaphore: ", err)
-    end
-
-    if rebuild_timeout < 0 then
-      get_plugins = function()
-        return plugins
-      end
-
-    else
-      get_plugins = function()
-        rebuild_plugins(rebuild_timeout)
-        return plugins
-      end
-    end
   end
 
   local function should_process_route(route)
@@ -354,17 +589,17 @@ do
       if ngx.get_phase() == "init" then
         log(DEBUG, "initialising router...")
       else
-        log(DEBUG, "initialising router on worker #", worker_id, "...")
+        log(DEBUG, "initialising router on worker #", WORKER_ID, "...")
       end
 
     else
-      log(DEBUG, "rebuilding router on worker #", worker_id, "...")
+      log(DEBUG, "rebuilding router on worker #", WORKER_ID, "...")
     end
 
     tries = tries or 1
 
     local current_version
-    current_version = get_router_version()
+    current_version = get_version("router")
     if version ~= current_version then
       return build_router(current_version, recurse, tries)
     end
@@ -373,7 +608,7 @@ do
 
     for route, err in kong.db.routes:each(1000) do
       if err then
-        current_version = get_router_version()
+        current_version = get_version("router")
         if version ~= current_version then
           return build_router(current_version, recurse, tries)
         end
@@ -390,7 +625,7 @@ do
       end
 
       if recurse and counter % 1000 then
-        current_version = get_router_version()
+        current_version = get_version("router")
         if version ~= current_version then
           return build_router(current_version, recurse, tries)
         end
@@ -399,7 +634,7 @@ do
       if should_process_route(route) then
         local service, err = get_service_for_route(route)
         if err then
-          current_version = get_router_version()
+          current_version = get_version("router")
           if version ~= current_version then
             return build_router(current_version, recurse, tries)
           end
@@ -469,17 +704,17 @@ do
       if ngx.get_phase() == "init" then
         log(DEBUG, "initialising router done")
       else
-        log(DEBUG, "initialising router on worker #", worker_id, " done")
+        log(DEBUG, "initialising router on worker #", WORKER_ID, " done")
       end
 
     else
-      log(DEBUG, "rebuilding router on worker #", worker_id, " done")
+      log(DEBUG, "rebuilding router on worker #", WORKER_ID, " done")
     end
 
     if recurse then
-      current_version = get_router_version()
+      current_version = get_version("router")
       if version ~= current_version then
-        log(DEBUG, "rebuilding router on worker #", worker_id)
+        log(DEBUG, "rebuilding router on worker #", WORKER_ID)
         return build_router(current_version, recurse, tries)
       end
     end
@@ -492,17 +727,17 @@ do
       if ngx.get_phase() == "init" then
         log(DEBUG, "initialising plugins...")
       else
-        log(DEBUG, "initialising plugins on worker #", worker_id, "...")
+        log(DEBUG, "initialising plugins on worker #", WORKER_ID, "...")
       end
 
     else
-      log(DEBUG, "rebuilding plugins on worker #", worker_id, "...")
+      log(DEBUG, "rebuilding plugins on worker #", WORKER_ID, "...")
     end
 
     tries = tries or 1
 
     local current_version
-    current_version = get_plugins_version()
+    current_version = get_version("plugins")
     if version ~= current_version then
       return build_plugins(current_version)
     end
@@ -511,11 +746,12 @@ do
       map = {},
       cache = {},
     }
+
     local counter = 0
 
     for plugin, err in kong.db.plugins:each(1000) do
       if err then
-        current_version = get_plugins_version()
+        current_version = get_version("plugins")
         if version ~= current_version then
           return build_plugins(current_version)
         end
@@ -532,7 +768,7 @@ do
       end
 
       if recurse and counter % 1000 then
-        current_version = get_plugins_version()
+        current_version = get_version("plugins")
         if version ~= current_version then
           return build_plugins(current_version)
         end
@@ -541,8 +777,8 @@ do
       if should_process_plugin(plugin) then
         new_plugins.map[plugin.name] = true
 
-        local key = kong.db.plugins:cache_key(plugin)
-        new_plugins.cache[key] = plugin
+        local cache_key = kong.db.plugins:cache_key(plugin)
+        new_plugins.cache[cache_key] = plugin
       end
 
       counter = counter + 1
@@ -555,17 +791,17 @@ do
       if ngx.get_phase() == "init" then
         log(DEBUG, "initialising plugins done")
       else
-        log(DEBUG, "initialising plugins on worker #", worker_id, " done")
+        log(DEBUG, "initialising plugins on worker #", WORKER_ID, " done")
       end
 
     else
-      log(DEBUG, "rebuilding plugins on worker #", worker_id, " done")
+      log(DEBUG, "rebuilding plugins on worker #", WORKER_ID, " done")
     end
 
     if recurse then
-      current_version = get_plugins_version()
+      current_version = get_version("plugins")
       if version ~= current_version then
-        log(DEBUG, "rebuilding plugins on worker #", worker_id)
+        log(DEBUG, "rebuilding plugins on worker #", WORKER_ID)
         return build_plugins(current_version)
       end
     end
@@ -573,76 +809,37 @@ do
     return true
   end
 
-  local function rebuild_router_timer(premature, version)
+  local function rebuild_sync(callback, version)
+    kong.db:connect()
+
+    local pok, ok, err = pcall(callback, version)
+    if not pok or not ok then
+      log(CRIT, "could not rebuild synchronously: ", ok or err)
+    end
+
+    kong.db:setkeepalive()
+  end
+
+  local function rebuild_timer(premature, callback, version, semaphore)
     if premature then
-      unlock_router()
+      release_semaphore(semaphore)
       return
     end
 
     kong.db:connect()
 
-    local pok, ok, err = pcall(build_router, version, true)
+    local pok, ok, err = pcall(callback, version, true)
     if not pok or not ok then
-      log(CRIT, "could not asynchronously rebuild router: ", ok or err)
+      log(CRIT, "could not rebuild asynchronously: ", ok or err)
     end
 
-    unlock_router()
+    release_semaphore(semaphore)
 
     kong.db:setkeepalive()
   end
 
-  local function rebuild_plugins_timer(premature, version)
-    if premature then
-      unlock_plugins()
-      return
-    end
-
-    kong.db:connect()
-
-    local pok, ok, err = pcall(build_plugins, version, true)
-    if not pok or not ok then
-      log(CRIT, "could not asynchronously rebuild plugins: ", ok or err)
-    end
-
-    unlock_plugins()
-
-    kong.db:setkeepalive()
-  end
-
-  local function rebuild_router_sync(version)
-    kong.db:connect()
-
-    local pok, ok, err = pcall(build_router, version)
-    if not pok or not ok then
-      log(CRIT, "could not synchronously rebuild router: ", ok or err)
-    end
-
-    kong.db:setkeepalive()
-  end
-
-  local function rebuild_plugins_sync(version)
-    kong.db:connect()
-
-    local pok, ok, err = pcall(build_plugins, version)
-    if not pok or not ok then
-      log(CRIT, "could not synchronously rebuild plugins: ", ok or err)
-    end
-
-    kong.db:setkeepalive()
-  end
-
-  local function rebuild_router_async(version)
-    local ok, err = ngx.timer.at(0, rebuild_router_timer, version)
-    if not ok then
-      log(CRIT, "could not create rebuild router timer: ", err)
-      return false
-    end
-
-    return true
-  end
-
-  local function rebuild_plugins_async(version)
-    local ok, err = ngx.timer.at(0, rebuild_plugins_timer, version)
+  local function rebuild_async(callback, version, semaphore)
+    local ok, err = ngx.timer.at(0, rebuild_timer, callback, version, semaphore)
     if not ok then
       log(CRIT, "could not create rebuild plugins timer: ", err)
       return false
@@ -651,72 +848,46 @@ do
     return true
   end
 
-  rebuild_router = function(wait)
-    local version = get_router_version()
-    if version == router_version then
+  local function rebuild(name, callback, version, semaphore, wait)
+    local current_version = get_version(name)
+    if current_version == version then
       return
     end
 
-    local ok = lock_router(wait)
+    local ok = acquire_semaphore(semaphore, wait)
     if not ok then
       if wait and wait > 0 then
-        rebuild_router_sync(version)
+        rebuild_sync(callback, current_version, semaphore)
       end
 
       return
     end
 
-    version = get_router_version()
-    if version == router_version then
-      unlock_router()
+    current_version = get_version(name)
+    if current_version == version then
+      release_semaphore(semaphore)
       return
     end
 
     if wait and wait > 0 then
-      rebuild_router_sync(version)
-      unlock_router()
+      rebuild_sync(callback, current_version, semaphore)
+      release_semaphore(semaphore)
 
     else
-      ok = rebuild_router_async(version)
+      ok = rebuild_async(callback, current_version, semaphore)
       if not ok and wait == 0 then
-        rebuild_router_sync(version)
-        unlock_router()
+        rebuild_sync(callback, current_version, semaphore)
+        release_semaphore(semaphore)
       end
     end
   end
 
+  rebuild_router = function(wait)
+    rebuild("router", build_router, router_version, router_semaphore, wait)
+  end
+
   rebuild_plugins = function(wait)
-    local version = get_plugins_version()
-    if version == plugins_version then
-      return
-    end
-
-    local ok = lock_plugins(wait)
-    if not ok then
-      if wait and wait > 0 then
-        rebuild_plugins_sync(version)
-      end
-
-      return
-    end
-
-    version = get_plugins_version()
-    if version == plugins_version then
-      unlock_plugins()
-      return
-    end
-
-    if wait and wait > 0 then
-      rebuild_plugins_sync(version)
-      unlock_plugins()
-
-    else
-      ok = rebuild_plugins_async(version)
-      if not ok and wait == 0 then
-        rebuild_plugins_sync(version)
-        unlock_plugins()
-      end
-    end
+    rebuild("plugins", build_plugins, plugins_version, plugins_semaphore, wait)
   end
 
   -- for unit-testing purposes only
@@ -817,288 +988,9 @@ return {
 
   init_worker = {
     before = function()
-      worker_id = ngx.worker.id()
-
-      if kong.configuration.database == "off" then
-        rebuild_timeout = 60
-
-      else
-        if kong.configuration.async_rebuilds then
-          rebuild_timeout = -1
-        elseif kong.configuration.database == "cassandra" then
-          -- cassandra_timeout is defined in ms
-          rebuild_timeout = kong.configuration.cassandra_timeout / 1000
-        elseif kong.configuration.database == "postgres" then
-          -- pg_timeout is defined in ms
-          rebuild_timeout = kong.configuration.pg_timeout / 1000
-        else
-          rebuild_timeout = 60
-        end
-      end
-
-      init_router()
-      init_plugins()
-
-      local ok, err = load_declarative_config()
-      if not ok then
-        log(CRIT, "error loading declarative config file: ", err)
-        return
-      end
-
-      reports.init_worker()
-
-      -- initialize local local_events hooks
-      local db             = kong.db
-      local cache          = kong.cache
-      local worker_events  = kong.worker_events
-      local cluster_events = kong.cluster_events
-
-
-      -- events dispatcher
-
-
-      worker_events.register(function(data)
-        if not data.schema then
-          log(ngx.ERR, "[events] missing schema in crud subscriber")
-          return
-        end
-
-        if not data.entity then
-          log(ngx.ERR, "[events] missing entity in crud subscriber")
-          return
-        end
-
-        -- invalidate this entity anywhere it is cached if it has a
-        -- caching key
-
-        local cache_key = db[data.schema.name]:cache_key(data.entity)
-
-        if cache_key then
-          cache:invalidate(cache_key)
-        end
-
-        -- if we had an update, but the cache key was part of what was updated,
-        -- we need to invalidate the previous entity as well
-
-        if data.old_entity then
-          cache_key = db[data.schema.name]:cache_key(data.old_entity)
-          if cache_key then
-            cache:invalidate(cache_key)
-          end
-        end
-
-        if not data.operation then
-          log(ngx.ERR, "[events] missing operation in crud subscriber")
-          return
-        end
-
-        -- public worker events propagation
-
-        local entity_channel           = data.schema.table or data.schema.name
-        local entity_operation_channel = fmt("%s:%s", entity_channel,
-                                             data.operation)
-
-        -- crud:routes
-        local _, err = worker_events.post_local("crud", entity_channel, data)
-        if err then
-          log(ngx.ERR, "[events] could not broadcast crud event: ", err)
-          return
-        end
-
-        -- crud:routes:create
-        _, err = worker_events.post_local("crud", entity_operation_channel, data)
-        if err then
-          log(ngx.ERR, "[events] could not broadcast crud event: ", err)
-          return
-        end
-      end, "dao:crud")
-
-
-      -- local events (same worker)
-
-
-      worker_events.register(function()
-        log(DEBUG, "[events] Route updated, invalidating router")
-        cache:invalidate("router:version")
-      end, "crud", "routes")
-
-
-      worker_events.register(function(data)
-        if data.operation ~= "create" and
-           data.operation ~= "delete"
-        then
-          -- no need to rebuild the router if we just added a Service
-          -- since no Route is pointing to that Service yet.
-          -- ditto for deletion: if a Service if being deleted, it is
-          -- only allowed because no Route is pointing to it anymore.
-          log(DEBUG, "[events] Service updated, invalidating router")
-          cache:invalidate("router:version")
-        end
-      end, "crud", "services")
-
-
-      worker_events.register(function(data)
-        log(DEBUG, "[events] Plugin updated, invalidating plugins")
-        cache:invalidate("plugins:version")
-      end, "crud", "plugins")
-
-
-      -- SSL certs / SNIs invalidations
-
-
-      worker_events.register(function(data)
-        log(DEBUG, "[events] SNI updated, invalidating cached certificates")
-        local sn = data.entity
-
-        cache:invalidate("certificates:" .. sn.name)
-      end, "crud", "snis")
-
-
-      worker_events.register(function(data)
-        log(DEBUG, "[events] SSL cert updated, invalidating cached certificates")
-        local certificate = data.entity
-
-        for sn, err in db.snis:each_for_certificate({ id = certificate.id }, 1000) do
-          if err then
-            log(ERR, "[events] could not find associated snis for certificate: ",
-                     err)
-            break
-          end
-
-          cache:invalidate("certificates:" .. sn.name)
-        end
-      end, "crud", "certificates")
-
-
-      -- target updates
-
-
-      -- worker_events local handler: event received from DAO
-      worker_events.register(function(data)
-        local operation = data.operation
-        local target = data.entity
-        -- => to worker_events node handler
-        local _, err = worker_events.post("balancer", "targets", {
-          operation = data.operation,
-          entity = data.entity,
-        })
-        if err then
-          log(ERR, "failed broadcasting target ",
-              operation, " to workers: ", err)
-        end
-        -- => to cluster_events handler
-        local key = fmt("%s:%s", operation, target.upstream.id)
-        _, err = cluster_events:broadcast("balancer:targets", key)
-        if err then
-          log(ERR, "failed broadcasting target ", operation, " to cluster: ", err)
-        end
-      end, "crud", "targets")
-
-
-      -- worker_events node handler
-      worker_events.register(function(data)
-        local operation = data.operation
-        local target = data.entity
-
-        -- => to balancer update
-        balancer.on_target_event(operation, target)
-      end, "balancer", "targets")
-
-
-      -- cluster_events handler
-      cluster_events:subscribe("balancer:targets", function(data)
-        local operation, key = unpack(utils.split(data, ":"))
-        -- => to worker_events node handler
-        local _, err = worker_events.post("balancer", "targets", {
-          operation = operation,
-          entity = {
-            upstream = { id = key },
-          }
-        })
-        if err then
-          log(ERR, "failed broadcasting target ", operation, " to workers: ", err)
-        end
-      end)
-
-
-      -- manual health updates
-      cluster_events:subscribe("balancer:post_health", function(data)
-        local pattern = "([^|]+)|([^|]+)|([^|]+)|([^|]+)|(.*)"
-        local ip, port, health, id, name = data:match(pattern)
-        port = tonumber(port)
-        local upstream = { id = id, name = name }
-        local _, err = balancer.post_health(upstream, ip, port, health == "1")
-        if err then
-          log(ERR, "failed posting health of ", name, " to workers: ", err)
-        end
-      end)
-
-
-      -- upstream updates
-
-
-      -- worker_events local handler: event received from DAO
-      worker_events.register(function(data)
-        local operation = data.operation
-        local upstream = data.entity
-        -- => to worker_events node handler
-        local _, err = worker_events.post("balancer", "upstreams", {
-          operation = data.operation,
-          entity = data.entity,
-        })
-        if err then
-          log(ERR, "failed broadcasting upstream ",
-              operation, " to workers: ", err)
-        end
-        -- => to cluster_events handler
-        local key = fmt("%s:%s:%s", operation, upstream.id, upstream.name)
-        local ok, err = cluster_events:broadcast("balancer:upstreams", key)
-        if not ok then
-          log(ERR, "failed broadcasting upstream ", operation, " to cluster: ", err)
-        end
-      end, "crud", "upstreams")
-
-
-      -- worker_events node handler
-      worker_events.register(function(data)
-        local operation = data.operation
-        local upstream = data.entity
-
-        -- => to balancer update
-        balancer.on_upstream_event(operation, upstream)
-      end, "balancer", "upstreams")
-
-
-      cluster_events:subscribe("balancer:upstreams", function(data)
-        local operation, id, name = unpack(utils.split(data, ":"))
-        -- => to worker_events node handler
-        local _, err = worker_events.post("balancer", "upstreams", {
-          operation = operation,
-          entity = {
-            id = id,
-            name = name,
-          }
-        })
-        if err then
-          log(ERR, "failed broadcasting upstream ", operation, " to workers: ", err)
-        end
-      end)
-
-
-      -- initialize balancers for active healthchecks
-      ngx.timer.at(0, function()
-        balancer.init()
-      end)
-
-
-      ngx.timer.every(1, function(premature)
-        if premature then
-          return
-        end
-
-        rebuild_router()
-        rebuild_plugins()
-      end)
+      init_worker()
+      register_events()
+      start_timers()
     end
   },
   certificate = {
