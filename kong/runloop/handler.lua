@@ -134,9 +134,8 @@ local function load_declarative_config()
     kong.log.notice("declarative config loaded from ",
                     kong.configuration.declarative_config)
 
-    build_plugins(utils.uuid())
-
     assert(build_router("init"))
+    assert(build_plugins("init"))
 
     mesh.init()
 
@@ -686,8 +685,6 @@ do
       unlock_plugins()
       return
     end
-
-    log(DEBUG, "rebuilding plugins")
 
     if wait and wait > 0 then
       rebuild_plugins_sync(version)
