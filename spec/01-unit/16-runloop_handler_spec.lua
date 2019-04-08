@@ -115,7 +115,7 @@ describe("runloop handler", function()
       handler.access.before({})
 
       assert.spy(rebuild_router_spy).was_called(1)
-      assert.spy(rebuild_plugins_spy).was_called(1)
+      assert.spy(rebuild_plugins_spy).was_called(0)
 
       -- check semaphore
       assert.equal(1, semaphores[1].value)
@@ -147,7 +147,7 @@ describe("runloop handler", function()
 
       -- was called even if semaphore timed out on acquisition
       assert.spy(rebuild_router_spy).was_called(1)
-      assert.spy(rebuild_plugins_spy).was_called(1)
+      assert.spy(rebuild_plugins_spy).was_called(0)
 
       -- check semaphore
       assert.equal(1, semaphores[1].value)

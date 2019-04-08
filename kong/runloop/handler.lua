@@ -354,11 +354,11 @@ do
       if ngx.get_phase() == "init" then
         log(DEBUG, "initialising router...")
       else
-        log(DEBUG, "initialising router on worker #", ngx.worker.id(), "...")
+        log(DEBUG, "initialising router on worker #", worker_id, "...")
       end
 
     else
-      log(DEBUG, "rebuilding router on worker #", ngx.worker.id(), "...")
+      log(DEBUG, "rebuilding router on worker #", worker_id, "...")
     end
 
     tries = tries or 1
@@ -469,17 +469,17 @@ do
       if ngx.get_phase() == "init" then
         log(DEBUG, "initialising router done")
       else
-        log(DEBUG, "initialising router on worker #", ngx.worker.id(), " done")
+        log(DEBUG, "initialising router on worker #", worker_id, " done")
       end
 
     else
-      log(DEBUG, "rebuilding router on worker #", ngx.worker.id(), " done")
+      log(DEBUG, "rebuilding router on worker #", worker_id, " done")
     end
 
     if recurse then
       current_version = get_router_version()
       if version ~= current_version then
-        log(DEBUG, "rebuilding router on worker #", ngx.worker.id())
+        log(DEBUG, "rebuilding router on worker #", worker_id)
         return build_router(current_version, recurse, tries)
       end
     end
@@ -492,11 +492,11 @@ do
       if ngx.get_phase() == "init" then
         log(DEBUG, "initialising plugins...")
       else
-        log(DEBUG, "initialising plugins on worker #", ngx.worker.id(), "...")
+        log(DEBUG, "initialising plugins on worker #", worker_id, "...")
       end
 
     else
-      log(DEBUG, "rebuilding plugins on worker #", ngx.worker.id(), "...")
+      log(DEBUG, "rebuilding plugins on worker #", worker_id, "...")
     end
 
     tries = tries or 1
@@ -555,7 +555,7 @@ do
       if ngx.get_phase() == "init" then
         log(DEBUG, "initialising plugins done")
       else
-        log(DEBUG, "initialising plugins on worker #", ngx.worker.id(), " done")
+        log(DEBUG, "initialising plugins on worker #", worker_id, " done")
       end
 
     else
